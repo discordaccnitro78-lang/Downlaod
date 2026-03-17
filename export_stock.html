@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Export Stock — Hexagen</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #0a0a0f;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+  }
+  .card {
+    background: #111118;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    padding: 2rem;
+    width: 100%;
+    max-width: 520px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+  }
+  h1 { font-size: 1.15rem; font-weight: 600; color: #fff; margin-bottom: .35rem; letter-spacing: .02em; }
+  .sub { font-size: .8rem; color: #64748b; margin-bottom: 1.75rem; }
+  label { font-size: .72rem; color: #64748b; letter-spacing: .05em; text-transform: uppercase; display: block; margin-bottom: .35rem; }
+  input {
+    width: 100%; padding: .65rem .85rem;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px; color: #fff;
+    font-family: monospace; font-size: .8rem;
+    outline: none; margin-bottom: 1.1rem;
+    transition: border-color .15s;
+  }
+  input:focus { border-color: rgba(124,58,237,0.5); }
+  .hint { font-size: .72rem; color: #475569; margin-top: -.7rem; margin-bottom: 1.1rem; }
+  button {
+    width: 100%; padding: .75rem;
+    background: #7C3AED; border: none; border-radius: 8px;
+    color: #fff; font-size: .875rem; font-weight: 500;
+    cursor: pointer; transition: background .15s;
+    display: flex; align-items: center; justify-content: center; gap: .5rem;
+  }
+  button:hover { background: #6D28D9; }
+  button:disabled { background: rgba(124,58,237,0.3); cursor: not-allowed; }
+  #log {
+    margin-top: 1.25rem;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px;
+    padding: .875rem 1rem;
+    font-size: .78rem;
+    font-family: monospace;
+    color: #94a3b8;
+    max-height: 240px;
+    overflow-y: auto;
+    display: none;
+    line-height: 1.8;
+  }
+  .ok  { color: #4ade80; }
+  .err { color: #f87171; }
+  .inf { color: #60a5fa; }
+  .spin {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.2);
+    border-top-color: #fff;
+    animation: spin .6s linear infinite;
+    display: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>⬇ Export Stock Hexagen</h1>
+  <p class="sub">Télécharge un fichier .txt par service avec les credentials déchiffrés.</p>
+
+  <label>Supabase Service Role Key</label>
+  <input type="password" id="skey" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." />
+  <p class="hint">Supabase → Settings → API → service_role key (secret)</p>
+
+  <label>Clé de chiffrement (pré-remplie)</label>
+  <input type="password" id="enckey" value="a27c8f1236ce0b7b62ab2c4d28211836d362525e58b1bf2ae7d28e45be94134f" />
+
+  <button id="btn" onclick="run()">
+    <div class="spin" id="spin"></div>
+    <span id="btntxt">Exporter le stock</span>
+  </button>
+
+  <div id="log"></div>
+</div>
+
+<script>
+const SUPABASE_URL = "https://otagzbzxwacajudmfcia.supabase.co"
+
+function log(msg, cls = "") {
+  const el = document.getElementById("log")
+  el.style.display = "block"
+  el.innerHTML += `<div class="${cls}">${msg}</div>`
+  el.scrollTop = el.scrollHeight
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < hex.length; i += 2)
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16)
+  return bytes
+}
+
+async function importKey(hexKey) {
+  const raw = hexToBytes(hexKey)
+  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["decrypt"])
+}
+
+async function decrypt(cryptoKey, credential) {
+  try {
+    const parts = credential.split(":")
+    if (parts.length !== 3) return credential
+    const [ivHex, authTagHex, encHex] = parts
+    const iv      = hexToBytes(ivHex)
+    const authTag = hexToBytes(authTagHex)
+    const enc     = hexToBytes(encHex)
+    // AES-GCM : on concatène encrypted + authTag pour Web Crypto
+    const combined = new Uint8Array(enc.length + authTag.length)
+    combined.set(enc)
+    combined.set(authTag, enc.length)
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv, tagLength: 128 },
+      cryptoKey,
+      combined
+    )
+    return new TextDecoder().decode(decrypted)
+  } catch {
+    return credential // retourne brut si échec
+  }
+}
+
+async function fetchAll(url, headers) {
+  // Pagination Supabase : 1000 par requête max
+  let all = [], offset = 0
+  while (true) {
+    const res = await fetch(`${url}&offset=${offset}&limit=1000`, { headers })
+    if (!res.ok) throw new Error(await res.text())
+    const data = await res.json()
+    all = all.concat(data)
+    if (data.length < 1000) break
+    offset += 1000
+  }
+  return all
+}
+
+function download(filename, content) {
+  const blob = new Blob([content], { type: "text/plain" })
+  const a = document.createElement("a")
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+async function run() {
+  const skey   = document.getElementById("skey").value.trim()
+  const encHex = document.getElementById("enckey").value.trim()
+  document.getElementById("log").innerHTML = ""
+  document.getElementById("log").style.display = "none"
+
+  if (!skey)   return log("❌ Clé Supabase manquante.", "err")
+  if (!encHex || encHex.length !== 64) return log("❌ Clé de chiffrement invalide (doit faire 64 caractères hex).", "err")
+
+  const btn  = document.getElementById("btn")
+  const spin = document.getElementById("spin")
+  const txt  = document.getElementById("btntxt")
+  btn.disabled = true
+  spin.style.display = "block"
+  txt.textContent = "Chargement..."
+
+  const headers = {
+    "apikey": skey,
+    "Authorization": `Bearer ${skey}`,
+    "Content-Type": "application/json"
+  }
+
+  try {
+    log("🔑 Import de la clé de déchiffrement...", "inf")
+    const cryptoKey = await importKey(encHex)
+
+    log("📡 Récupération des comptes depuis Supabase...", "inf")
+    const accounts = await fetchAll(
+      `${SUPABASE_URL}/rest/v1/Account?select=credential,tierId`,
+      headers
+    )
+    log(`✅ ${accounts.length} compte(s) trouvé(s) dans le stock.`, "ok")
+
+    log("📡 Récupération des services...", "inf")
+    const tiers = await fetchAll(
+      `${SUPABASE_URL}/rest/v1/ServiceTier?select=id,tier,serviceId`,
+      headers
+    )
+    const services = await fetchAll(
+      `${SUPABASE_URL}/rest/v1/Service?select=id,name`,
+      headers
+    )
+
+    // Maps
+    const tierMap    = {}
+    const serviceMap = {}
+    for (const t of tiers)    tierMap[t.id]    = t
+    for (const s of services) serviceMap[s.id] = s.name
+
+    // Grouper par service
+    const groups = {}
+    for (const acc of accounts) {
+      const tier = tierMap[acc.tierId]
+      if (!tier) continue
+      const svcName = serviceMap[tier.serviceId] ?? "unknown"
+      const key = `${svcName}_${tier.tier}`
+      if (!groups[key]) groups[key] = []
+      groups[key].push(acc.credential)
+    }
+
+    // Déchiffrer et télécharger
+    const keys = Object.keys(groups)
+    log(`📦 ${keys.length} service(s) à exporter...`, "inf")
+
+    let totalDecrypted = 0
+    for (const key of keys) {
+      const creds = groups[key]
+      const lines = []
+      for (const c of creds) {
+        const plain = await decrypt(cryptoKey, c)
+        lines.push(plain)
+        totalDecrypted++
+      }
+      const filename = `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}.txt`
+      download(filename, lines.join("\n"))
+      log(`✅ ${filename} — ${lines.length} compte(s)`, "ok")
+      await new Promise(r => setTimeout(r, 200)) // petit délai entre downloads
+    }
+
+    log(`🎉 Export terminé — ${totalDecrypted} credentials exportés.`, "ok")
+  } catch (err) {
+    log(`❌ Erreur : ${err.message}`, "err")
+  } finally {
+    btn.disabled = false
+    spin.style.display = "none"
+    txt.textContent = "Exporter le stock"
+  }
+}
+</script>
+</body>
+</html>
